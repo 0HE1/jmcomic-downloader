@@ -1,25 +1,25 @@
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time: :{Duration, SystemTime, UNIX_EPOCH};
 
-use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockDecrypt, KeyInit};
+use aes:: cipher:: generic_array::GenericArray;
+use aes::cipher: :{BlockDecrypt, KeyInit};
 use aes::Aes256;
-use anyhow::{anyhow, Context};
+use anyhow: :{anyhow, Context};
 use base64::engine::general_purpose;
 use base64::Engine;
 use bytes::Bytes;
-use image::ImageFormat;
+use image:: ImageFormat;
 use parking_lot::RwLock;
-use reqwest::cookie::Jar;
+use reqwest:: cookie:: Jar;
 use reqwest::StatusCode;
 use reqwest_middleware::ClientWithMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
-use reqwest_retry::{Jitter, RetryTransientMiddleware};
+use reqwest_retry: :{Jitter, RetryTransientMiddleware};
 use serde_json::json;
 use tauri::AppHandle;
 
 use crate::download_manager::IMAGE_DOMAIN;
-use crate::extensions::{AnyhowErrorToStringChain, AppHandleExt};
+use crate::extensions: :{AnyhowErrorToStringChain, AppHandleExt};
 use crate::responses::{
     GetChapterRespData, GetComicRespData, GetFavoriteRespData, GetUserProfileRespData,
     GetWeeklyInfoRespData, GetWeeklyRespData, JmResp, RedirectRespData, SearchResp, SearchRespData,
@@ -45,15 +45,13 @@ enum ApiPath {
     GetWeeklyInfo,
     GetWeekly,
 }
+
 impl ApiPath {
     fn as_str(&self) -> &'static str {
         match self {
-            // 没错，就是这么奇葩，获取用户信息也是用的/login
-            // 带AVS去请求/login，就能获取用户信息，而不需要用户名密码
-            // 如果AVS无效或过期，就走正常的登录流程
             ApiPath::Login | ApiPath::GetUserProfile => "/login",
             ApiPath::Search => "/search",
-            ApiPath::GetComic => "/album",
+            ApiPath:: GetComic => "/album",
             ApiPath::GetChapter => "/chapter",
             ApiPath::GetScrambleId => "/chapter_view_template",
             ApiPath::GetFavoriteFolder => "/favorite",
@@ -65,26 +63,33 @@ impl ApiPath {
 
 #[derive(Clone)]
 pub struct JmClient {
-    app: AppHandle,
+    app:  AppHandle,
     api_client: Arc<RwLock<ClientWithMiddleware>>,
     api_jar: Arc<Jar>,
     img_client: Arc<RwLock<ClientWithMiddleware>>,
+    // ✨ 新增：用于获取动态API域名的HTTP客户端
+    domain_client: Arc<RwLock<ClientWithMiddleware>>,
 }
 
 impl JmClient {
     pub fn new(app: AppHandle) -> Self {
-        let api_jar = Arc::new(Jar::default());
+        let api_jar = Arc::new(Jar:: default());
         let api_client = create_api_client(&app, &api_jar);
         let api_client = Arc::new(RwLock::new(api_client));
 
         let img_client = create_img_client(&app);
-        let img_client = Arc::new(RwLock::new(img_client));
+        let img_client = Arc::new(RwLock:: new(img_client));
+
+        // ✨ 新增：创建域名获取客户端
+        let domain_client = create_domain_client(&app);
+        let domain_client = Arc::new(RwLock::new(domain_client));
 
         Self {
             app,
             api_client,
             api_jar,
             img_client,
+            domain_client,
         }
     }
 
@@ -93,14 +98,85 @@ impl JmClient {
         *self.api_client.write() = api_client;
         let img_client = create_img_client(&self.app);
         *self.img_client.write() = img_client;
+        // ✨ 新增：重新加载域名获取客户端
+        let domain_client = create_domain_client(&self.app);
+        *self.domain_client.write() = domain_client;
+    }
+
+    // ✨ 新增：获取最新的API域名
+    pub async fn update_api_domains(&self) -> anyhow::Result<()> {
+        let config = self.app.get_config();
+        let mut config_guard = config.write();
+
+        // 检查是否需要更新
+        if ! config_guard.should_update_dynamic_api_domains() {
+            return Ok(());
+        }
+
+        drop(config_guard); // 释放写锁
+
+        // 从服务器获取最新的API域名
+        let server_list = crate::config::Config::get_api_domain_server_list();
+        let secret = crate::config::Config:: get_api_domain_server_secret();
+
+        for server_url in server_list {
+            match self.req_api_domain_server(server_url, secret).await {
+                Ok(domains) => {
+                    let mut config_guard = config.write();
+                    config_guard.update_dynamic_api_domains(domains);
+                    let _ = config_guard.save(&self.app);
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to get API domains from {}: {}", server_url, e);
+                    continue;
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "Failed to get API domains from all servers, using default domains"
+        ))
+    }
+
+    // ✨ 新增：请求API域名服务器
+    async fn req_api_domain_server(
+        &self,
+        url: &str,
+        secret: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let resp = self. domain_client.read().get(url).send().await?;
+        let mut text = resp.text().await?;
+
+        // 去掉开头非ascii字符
+        while ! text.is_empty() && !text.chars().next().unwrap().is_ascii() {
+            text = text[1..]. to_string();
+        }
+
+        // 解密响应数据
+        let res_json = decrypt_api_domain_server_data(&text, secret)?;
+        let res_data: serde_json::Value = serde_json::from_str(&res_json)?;
+
+        // 检查返回值
+        if let Some(server) = res_data.get("Server").and_then(|v| v.as_str()) {
+            if ! server.is_empty() {
+                // 将服务器返回的单个域名转换为列表
+                return Ok(vec![server.to_string()]);
+            }
+        }
+
+        Err(anyhow!(
+            "Failed to parse API domain server response: {}",
+            res_json
+        ))
     }
 
     async fn jm_request(
         &self,
         method: reqwest::Method,
         path: ApiPath,
-        query: Option<serde_json::Value>,
-        form: Option<serde_json::Value>,
+        query:  Option<serde_json::Value>,
+        form: Option<serde_json:: Value>,
         ts: u64,
     ) -> anyhow::Result<reqwest::Response> {
         let tokenparam = format!("{ts},{APP_VERSION}");
@@ -110,11 +186,25 @@ impl JmClient {
             utils::md5_hex(&format!("{ts}{APP_TOKEN_SECRET}"))
         };
 
-        let api_domain = self.app.get_config().read().get_api_domain();
+        // ✨ 改进：尝试动态获取最新的API域名
+        let api_domain = {
+            let config = self.app.get_config();
+            let config_guard = config.read();
+            
+            if config_guard.should_update_dynamic_api_domains() {
+                drop(config_guard);
+                // 在后台更新域名
+                let _ = self.update_api_domains().await;
+                self.app.get_config().read().get_api_domain()
+            } else {
+                config_guard.get_api_domain()
+            }
+        };
+
         let path = path.as_str();
         let request = self
             .api_client
-            .read()
+            . read()
             .request(method, format!("https://{api_domain}{path}").as_str())
             .header("token", token)
             .header("tokenparam", tokenparam)
@@ -126,7 +216,7 @@ impl JmClient {
         }
         .map_err(|e| {
             if e.is_timeout() {
-                anyhow::Error::from(e).context("连接超时，请使用代理或换条线路重试")
+                anyhow:: Error::from(e).context("连接超时，请使用代理或换条线路重试")
             } else {
                 anyhow::Error::from(e)
             }
@@ -138,7 +228,7 @@ impl JmClient {
     async fn jm_get(
         &self,
         path: ApiPath,
-        query: Option<serde_json::Value>,
+        query:  Option<serde_json::Value>,
         ts: u64,
     ) -> anyhow::Result<reqwest::Response> {
         self.jm_request(reqwest::Method::GET, path, query, None, ts)
@@ -156,12 +246,13 @@ impl JmClient {
             .await
     }
 
+    // ...  (其他方法保持不变) ...
     pub async fn login(
         &self,
         username: &str,
         password: &str,
     ) -> anyhow::Result<GetUserProfileRespData> {
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH)?. as_secs();
         let form = json!({
             "username": username,
             "password": password,
@@ -181,7 +272,7 @@ impl JmClient {
             .context(format!("将body解析为JmResp失败: {body}"))?;
         // 检查JmResp的code字段
         if jm_resp.code != 200 {
-            return Err(anyhow!("使用账号密码登录失败，预料之外的code: {jm_resp:?}"));
+            return Err(anyhow! ("使用账号密码登录失败，预料之外的code:  {jm_resp: ?}"));
         }
         // 检查JmResp的data字段
         let data = jm_resp.data.as_str().context(format!(
@@ -190,7 +281,7 @@ impl JmClient {
         // 解密data字段
         let data = decrypt_data(ts, data)?;
         // 尝试将解密后的data字段解析为GetUserProfileRespData
-        let mut user_profile = serde_json::from_str::<GetUserProfileRespData>(&data).context(
+        let mut user_profile = serde_json::from_str: :<GetUserProfileRespData>(&data).context(
             format!("将解密后的data字段解析为GetUserProfileRespData失败: {data}"),
         )?;
         user_profile.photo = format!("https://{IMAGE_DOMAIN}/media/users/{}", user_profile.photo);
@@ -207,8 +298,8 @@ impl JmClient {
         // 检查http响应状态码
         let status = http_resp.status();
         let body = http_resp.text().await?;
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(anyhow!("获取用户信息失败，Cookie无效或已过期，请重新登录"));
+        if status == reqwest::StatusCode:: UNAUTHORIZED {
+            return Err(anyhow! ("获取用户信息失败，Cookie无效或已过期，请重新登录"));
         } else if status != reqwest::StatusCode::OK {
             return Err(anyhow!(
                 "获取用户信息失败，预料之外的状态码({status}): {body}"
@@ -219,20 +310,20 @@ impl JmClient {
             .context(format!("将body解析为JmResp失败: {body}"))?;
         // 检查JmResp的code字段
         if jm_resp.code != 200 {
-            return Err(anyhow!("获取用户信息失败，预料之外的code: {jm_resp:?}"));
+            return Err(anyhow!("获取用户信息失败，预料之外的code: {jm_resp: ?}"));
         }
         // 检查JmResp的data字段
         let data = jm_resp
             .data
             .as_str()
-            .context(format!("获取用户信息失败，data字段不是字符串: {jm_resp:?}"))?;
+            .context(format!("获取用户信息失败，data字段不是字符串: {jm_resp:? }"))?;
         // 解密data字段
         let data = decrypt_data(ts, data)?;
         // 尝试将解密后的data字段解析为GetUserProfileRespData
         let mut user_profile = serde_json::from_str::<GetUserProfileRespData>(&data).context(
             format!("将解密后的data字段解析为GetUserProfileRespData失败: {data}"),
         )?;
-        user_profile.photo = format!("https://{IMAGE_DOMAIN}/media/users/{}", user_profile.photo);
+        user_profile. photo = format!("https://{IMAGE_DOMAIN}/media/users/{}", user_profile.photo);
 
         Ok(user_profile)
     }
@@ -240,14 +331,14 @@ impl JmClient {
     pub async fn search(
         &self,
         keyword: &str,
-        page: i64,
-        sort: SearchSort,
+        page:  i64,
+        sort:  SearchSort,
     ) -> anyhow::Result<SearchResp> {
         let query = json!({
             "main_tag": 0,
             "search_query": keyword,
-            "page": page,
-            "o": sort.as_str(),
+            "page":  page,
+            "o":  sort.as_str(),
         });
         let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         // 发送搜索请求
@@ -256,14 +347,14 @@ impl JmClient {
         let status = http_resp.status();
         let body = http_resp.text().await?;
         if status != reqwest::StatusCode::OK {
-            return Err(anyhow!("搜索失败，预料之外的状态码({status}): {body}"));
+            return Err(anyhow! ("搜索失败，预料之外的状态码({status}): {body}"));
         }
         // 尝试将body解析为JmResp
         let jm_resp = serde_json::from_str::<JmResp>(&body)
-            .context(format!("将body解析为JmResp失败: {body}"))?;
+            .context(format!("将body解析为JmResp失败:  {body}"))?;
         // 检查JmResp的code字段
         if jm_resp.code != 200 {
-            return Err(anyhow!("搜索失败，预料之外的code: {jm_resp:?}"));
+            return Err(anyhow!("搜索失败，预料之外的code: {jm_resp:? }"));
         }
         // 检查JmResp的data字段
         let data = jm_resp
@@ -275,16 +366,16 @@ impl JmClient {
         // 尝试将解密后的数据解析为 RedirectRespData
         if let Ok(redirect_resp_data) = serde_json::from_str::<RedirectRespData>(&data) {
             let comic_resp_data = self
-                .get_comic(redirect_resp_data.redirect_aid.parse()?)
+                .get_comic(redirect_resp_data.redirect_aid. parse()?)
                 .await?;
-            return Ok(SearchResp::ComicRespData(Box::new(comic_resp_data)));
+            return Ok(SearchResp:: ComicRespData(Box::new(comic_resp_data)));
         }
         // 尝试将解密后的data字段解析为 SearchRespData
         if let Ok(search_resp_data) = serde_json::from_str::<SearchRespData>(&data) {
             return Ok(SearchResp::SearchRespData(search_resp_data));
         }
         Err(anyhow!(
-            "将解密后的数据解析为SearchRespData或RedirectRespData失败: {data}"
+            "将解密后的数据解析为SearchRespData或RedirectRespData失败:  {data}"
         ))
     }
 
@@ -300,11 +391,11 @@ impl JmClient {
             return Err(anyhow!("获取漫画失败，预料之外的状态码({status}): {body}"));
         }
         // 尝试将body解析为JmResp
-        let jm_resp = serde_json::from_str::<JmResp>(&body)
-            .context(format!("将body解析为JmResp失败: {body}"))?;
+        let jm_resp = serde_json::from_str: :<JmResp>(&body)
+            .context(format! ("将body解析为JmResp失败: {body}"))?;
         // 检查JmResp的code字段
-        if jm_resp.code != 200 {
-            return Err(anyhow!("获取漫画失败，预料之外的code: {jm_resp:?}"));
+        if jm_resp. code != 200 {
+            return Err(anyhow! ("获取漫画失败，预料之外的code:  {jm_resp:?}"));
         }
         // 检查JmResp的data字段
         let data = jm_resp
@@ -329,10 +420,10 @@ impl JmClient {
         let status = http_resp.status();
         let body = http_resp.text().await?;
         if status != reqwest::StatusCode::OK {
-            return Err(anyhow!("获取章节失败，预料之外的状态码({status}): {body}"));
+            return Err(anyhow! ("获取章节失败，预料之外的状态码({status}): {body}"));
         }
         // 尝试将body解析为JmResp
-        let jm_resp = serde_json::from_str::<JmResp>(&body)
+        let jm_resp = serde_json:: from_str::<JmResp>(&body)
             .context(format!("将body解析为JmResp失败: {body}"))?;
         // 检查JmResp的code字段
         if jm_resp.code != 200 {
@@ -342,11 +433,11 @@ impl JmClient {
         let data = jm_resp
             .data
             .as_str()
-            .context(format!("获取章节失败，data字段不是字符串: {jm_resp:?}"))?;
+            .context(format! ("获取章节失败，data字段不是字符串: {jm_resp:? }"))?;
         // 解密data字段
         let data = decrypt_data(ts, data)?;
         // 尝试将解密后的data字段解析为GetChapterRespData
-        let chapter = serde_json::from_str::<GetChapterRespData>(&data).context(format!(
+        let chapter = serde_json::from_str: :<GetChapterRespData>(&data).context(format!(
             "将解密后的data字段解析为GetChapterRespData失败: {data}"
         ))?;
         Ok(chapter)
@@ -354,20 +445,20 @@ impl JmClient {
 
     pub async fn get_scramble_id(&self, id: i64) -> anyhow::Result<i64> {
         let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let query = json!({
+        let query = json! ({
             "id": id,
             "v": ts,
             "mode": "vertical",
             "page": 0,
             "app_img_shunt": 1,
-            "express": "off",
+            "express":  "off",
         });
         // 发送获取scramble_id请求
         let http_resp = self.jm_get(ApiPath::GetScrambleId, Some(query), ts).await?;
         // 检查http响应状态码
         let status = http_resp.status();
         let body = http_resp.text().await?;
-        if status != reqwest::StatusCode::OK {
+        if status != reqwest:: StatusCode::OK {
             return Err(anyhow!(
                 "获取scramble_id失败，预料之外的状态码({status}): {body}"
             ));
@@ -376,7 +467,7 @@ impl JmClient {
         let scramble_id = body
             .split("var scramble_id = ")
             .nth(1)
-            .and_then(|s| s.split(';').next())
+            .and_then(|s| s. split(';').next())
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(220_980);
         Ok(scramble_id)
@@ -386,9 +477,9 @@ impl JmClient {
         &self,
         folder_id: i64,
         page: i64,
-        sort: FavoriteSort,
+        sort:  FavoriteSort,
     ) -> anyhow::Result<GetFavoriteRespData> {
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let ts = SystemTime:: now().duration_since(UNIX_EPOCH)?.as_secs();
         let query = json!({
             "page": page,
             "o": sort.as_str(),
@@ -407,7 +498,7 @@ impl JmClient {
             ));
         }
         // 尝试将body解析为JmResp
-        let jm_resp = serde_json::from_str::<JmResp>(&body)
+        let jm_resp = serde_json:: from_str::<JmResp>(&body)
             .context(format!("将body解析为JmResp失败: {body}"))?;
         // 检查JmResp的code字段
         if jm_resp.code != 200 {
@@ -416,7 +507,7 @@ impl JmClient {
         // 检查JmResp的data字段
         let data = jm_resp
             .data
-            .as_str()
+            . as_str()
             .context(format!("获取收藏夹失败，data字段不是字符串: {jm_resp:?}"))?;
         // 解密data字段
         let data = decrypt_data(ts, data)?;
@@ -439,15 +530,15 @@ impl JmClient {
             ));
         }
         // 尝试将body解析为JmResp
-        let jm_resp = serde_json::from_str::<JmResp>(&body)
+        let jm_resp = serde_json:: from_str::<JmResp>(&body)
             .context(format!("将body解析为JmResp失败: {body}"))?;
         // 检查JmResp的code字段
         if jm_resp.code != 200 {
             return Err(anyhow!("获取每周必看信息失败，预料之外的code: {jm_resp:?}"));
         }
         // 检查JmResp的data字段
-        let data = jm_resp.data.as_str().context(format!(
-            "获取每周必看信息失败，data字段不是字符串: {jm_resp:?}"
+        let data = jm_resp. data.as_str().context(format!(
+            "获取每周必看信息失败，data字段不是字符串: {jm_resp:? }"
         ))?;
         // 解密data字段
         let data = decrypt_data(ts, data)?;
@@ -482,11 +573,11 @@ impl JmClient {
             .context(format!("将body解析为JmResp失败: {body}"))?;
         // 检查JmResp的code字段
         if jm_resp.code != 200 {
-            return Err(anyhow!("获取每周必看信息失败，预料之外的code: {jm_resp:?}"));
+            return Err(anyhow!("获取每周必看信息失败，预料之外的code:  {jm_resp:?}"));
         }
         // 检查JmResp的data字段
-        let data = jm_resp.data.as_str().context(format!(
-            "获取每周必看信息失败，data字段不是字符串: {jm_resp:?}"
+        let data = jm_resp. data.as_str().context(format!(
+            "获取每周必看信息失败，data字段不是字符串: {jm_resp:? }"
         ))?;
         // 解密data字段
         let data = decrypt_data(ts, data)?;
@@ -542,7 +633,7 @@ impl JmClient {
         let status = http_resp.status();
         if status != StatusCode::OK {
             let text = http_resp.text().await?;
-            let err = anyhow!("下载图片`{url}`失败，预料之外的状态码: {text}");
+            let err = anyhow! ("下载图片`{url}`失败，预料之外的状态码:  {text}");
             return Err(err);
         }
 
@@ -557,7 +648,7 @@ impl JmClient {
 
             let http_resp = request.send().await?;
             let status = http_resp.status();
-            if status != StatusCode::OK {
+            if status != StatusCode:: OK {
                 let text = http_resp.text().await?;
                 let err = anyhow!("下载图片`{url}`失败，预料之外的状态码: {text}");
                 return Err(err);
@@ -576,7 +667,7 @@ impl JmClient {
         // 确定原始图片格式
         let format = match content_type.as_str() {
             "image/webp" => ImageFormat::WebP,
-            "image/gif" => ImageFormat::Gif,
+            "image/gif" => ImageFormat:: Gif,
             _ => return Err(anyhow!("原图出现了意料之外的格式: {content_type}")),
         };
 
@@ -584,7 +675,7 @@ impl JmClient {
     }
 }
 
-pub fn create_api_client(app: &AppHandle, jar: &Arc<Jar>) -> ClientWithMiddleware {
+pub fn create_api_client(app:  &AppHandle, jar: &Arc<Jar>) -> ClientWithMiddleware {
     let builder = reqwest::ClientBuilder::new().cookie_provider(jar.clone());
 
     let proxy_mode = app.get_config().read().proxy_mode.clone();
@@ -602,7 +693,7 @@ pub fn create_api_client(app: &AppHandle, jar: &Arc<Jar>) -> ClientWithMiddlewar
                 Ok(proxy) => builder.proxy(proxy),
                 Err(err) => {
                     let err_title = format!("`JmClient`设置代理`{proxy_url}`失败");
-                    let string_chain = err.to_string_chain();
+                    let string_chain = err. to_string_chain();
                     tracing::error!(err_title, message = string_chain);
                     builder
                 }
@@ -611,11 +702,11 @@ pub fn create_api_client(app: &AppHandle, jar: &Arc<Jar>) -> ClientWithMiddlewar
     };
 
     let retry_policy = ExponentialBackoff::builder()
-        .base(1) // 指数为1，保证重试间隔为1秒不变
-        .jitter(Jitter::Bounded) // 重试间隔在1秒左右波动
-        .build_with_total_retry_duration(Duration::from_secs(5)); // 重试总时长为5秒
+        .base(1)
+        .jitter(Jitter::Bounded)
+        .build_with_total_retry_duration(Duration::from_secs(5));
 
-    reqwest_middleware::ClientBuilder::new(builder.build().unwrap())
+    reqwest_middleware::ClientBuilder::new(builder. build().unwrap())
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
         .build()
 }
@@ -626,19 +717,19 @@ pub fn create_img_client(app: &AppHandle) -> ClientWithMiddleware {
     let proxy_mode = app.get_config().read().proxy_mode.clone();
     let builder = match proxy_mode {
         ProxyMode::System => builder,
-        ProxyMode::NoProxy => builder.no_proxy(),
+        ProxyMode:: NoProxy => builder.no_proxy(),
         ProxyMode::Custom => {
             let config = app.get_config();
             let config = config.read();
-            let proxy_host = &config.proxy_host;
+            let proxy_host = &config. proxy_host;
             let proxy_port = &config.proxy_port;
             let proxy_url = format!("http://{proxy_host}:{proxy_port}");
 
-            match reqwest::Proxy::all(&proxy_url).map_err(anyhow::Error::from) {
+            match reqwest:: Proxy::all(&proxy_url).map_err(anyhow:: Error::from) {
                 Ok(proxy) => builder.proxy(proxy),
                 Err(err) => {
                     let err_title = format!("`DownloadManager`设置代理`{proxy_url}`失败");
-                    let string_chain = err.to_string_chain();
+                    let string_chain = err. to_string_chain();
                     tracing::error!(err_title, message = string_chain);
                     builder
                 }
@@ -648,19 +739,78 @@ pub fn create_img_client(app: &AppHandle) -> ClientWithMiddleware {
 
     let retry_policy = ExponentialBackoff::builder().build_with_max_retries(2);
 
-    reqwest_middleware::ClientBuilder::new(builder.build().unwrap())
-        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+    reqwest_middleware:: ClientBuilder::new(builder.build().unwrap())
+        .with(RetryTransientMiddleware:: new_with_policy(retry_policy))
+        .build()
+}
+
+// ✨ 新增：为域名获取创建专用的HTTP客户端
+pub fn create_domain_client(app: &AppHandle) -> ClientWithMiddleware {
+    let builder = reqwest::ClientBuilder:: new();
+
+    let proxy_mode = app.get_config().read().proxy_mode.clone();
+    let builder = match proxy_mode {
+        ProxyMode::System => builder,
+        ProxyMode::NoProxy => builder.no_proxy(),
+        ProxyMode:: Custom => {
+            let config = app.get_config();
+            let config = config.read();
+            let proxy_host = &config.proxy_host;
+            let proxy_port = &config.proxy_port;
+            let proxy_url = format!("http://{proxy_host}:{proxy_port}");
+
+            match reqwest:: Proxy::all(&proxy_url).map_err(anyhow::Error::from) {
+                Ok(proxy) => builder.proxy(proxy),
+                Err(err) => {
+                    let err_title = format!("`DomainClient`设置代理`{proxy_url}`失败");
+                    let string_chain = err. to_string_chain();
+                    tracing::error!(err_title, message = string_chain);
+                    builder
+                }
+            }
+        }
+    };
+
+    let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
+
+    reqwest_middleware:: ClientBuilder::new(builder.build().unwrap())
+        .with(RetryTransientMiddleware:: new_with_policy(retry_policy))
         .build()
 }
 
 fn decrypt_data(ts: u64, data: &str) -> anyhow::Result<String> {
     // 使用Base64解码传入的数据，得到AES-256-ECB加密的数据
-    let aes256_ecb_encrypted_data = general_purpose::STANDARD.decode(data)?;
+    let aes256_ecb_encrypted_data = general_purpose:: STANDARD. decode(data)?;
     // 生成密钥
     let key = utils::md5_hex(&format!("{ts}{APP_DATA_SECRET}"));
     // 使用AES-256-ECB进行解密
+    let cipher = Aes256:: new(GenericArray::from_slice(key.as_bytes()));
+    let decrypted_data_with_padding:  Vec<u8> = aes256_ecb_encrypted_data
+        .chunks(16)
+        .map(GenericArray::clone_from_slice)
+        .flat_map(|mut block| {
+            cipher.decrypt_block(&mut block);
+            block. to_vec()
+        })
+        .collect();
+    // 去除PKCS#7填充，根据最后一个字节的值确定填充长度
+    let padding_length = decrypted_data_with_padding.last().copied().unwrap() as usize;
+    let decrypted_data_without_padding =
+        decrypted_data_with_padding[..decrypted_data_with_padding.len() - padding_length].to_vec();
+    // 将解密后的数据转换为UTF-8字符串
+    let decrypted_data = String::from_utf8(decrypted_data_without_padding)?;
+    Ok(decrypted_data)
+}
+
+// ✨ 新增：解密API域名服务器返回的数据（使用不同的密钥）
+fn decrypt_api_domain_server_data(data: &str, secret: &str) -> anyhow::Result<String> {
+    // 使用Base64解码传入的数据
+    let encrypted_data = general_purpose:: STANDARD.decode(data)?;
+    // 生成密钥（使用提供的secret而不是时间戳）
+    let key = utils::md5_hex(secret);
+    // 使用AES-256-ECB进行解密
     let cipher = Aes256::new(GenericArray::from_slice(key.as_bytes()));
-    let decrypted_data_with_padding: Vec<u8> = aes256_ecb_encrypted_data
+    let decrypted_data_with_padding: Vec<u8> = encrypted_data
         .chunks(16)
         .map(GenericArray::clone_from_slice)
         .flat_map(|mut block| {
@@ -668,8 +818,8 @@ fn decrypt_data(ts: u64, data: &str) -> anyhow::Result<String> {
             block.to_vec()
         })
         .collect();
-    // 去除PKCS#7填充，根据最后一个字节的值确定填充长度
-    let padding_length = decrypted_data_with_padding.last().copied().unwrap() as usize;
+    // 去除PKCS#7填充
+    let padding_length = decrypted_data_with_padding. last().copied().unwrap() as usize;
     let decrypted_data_without_padding =
         decrypted_data_with_padding[..decrypted_data_with_padding.len() - padding_length].to_vec();
     // 将解密后的数据转换为UTF-8字符串
