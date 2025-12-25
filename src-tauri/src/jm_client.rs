@@ -281,7 +281,7 @@ impl JmClient {
         // 解密data字段
         let data = decrypt_data(ts, data)?;
         // 尝试将解密后的data字段解析为GetUserProfileRespData
-        let mut user_profile = serde_json::from_str: :<GetUserProfileRespData>(&data).context(
+        let mut user_profile = serde_json::from_str::<GetUserProfileRespData>(&data).context(
             format!("将解密后的data字段解析为GetUserProfileRespData失败: {data}"),
         )?;
         user_profile.photo = format!("https://{IMAGE_DOMAIN}/media/users/{}", user_profile.photo);
@@ -391,7 +391,7 @@ impl JmClient {
             return Err(anyhow!("获取漫画失败，预料之外的状态码({status}): {body}"));
         }
         // 尝试将body解析为JmResp
-        let jm_resp = serde_json::from_str: :<JmResp>(&body)
+        let jm_resp = serde_json::from_str::<JmResp>(&body)
             .context(format! ("将body解析为JmResp失败: {body}"))?;
         // 检查JmResp的code字段
         if jm_resp. code != 200 {
@@ -437,7 +437,7 @@ impl JmClient {
         // 解密data字段
         let data = decrypt_data(ts, data)?;
         // 尝试将解密后的data字段解析为GetChapterRespData
-        let chapter = serde_json::from_str: :<GetChapterRespData>(&data).context(format!(
+        let chapter = serde_json::from_str::<GetChapterRespData>(&data).context(format!(
             "将解密后的data字段解析为GetChapterRespData失败: {data}"
         ))?;
         Ok(chapter)
