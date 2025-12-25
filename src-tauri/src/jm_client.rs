@@ -272,7 +272,11 @@ impl JmClient {
             .context(format!("将body解析为JmResp失败: {body}"))?;
         // 检查JmResp的code字段
         if jm_resp.code != 200 {
-            return Err(anyhow! ("使用账号密码登录失败，预料之外的code:  {jm_resp: ?}"));
+            return Err(anyhow!(
+    "使用账号密码登录失败，预料之外的code: {:?}",
+    jm_resp
+));
+
         }
         // 检查JmResp的data字段
         let data = jm_resp.data.as_str().context(format!(
@@ -310,7 +314,11 @@ impl JmClient {
             .context(format!("将body解析为JmResp失败: {body}"))?;
         // 检查JmResp的code字段
         if jm_resp.code != 200 {
-            return Err(anyhow!("获取用户信息失败，预料之外的code: {jm_resp: ?}"));
+            return Err(anyhow!(
+    "获取用户信息失败，预料之外的code: {:?}",
+    jm_resp
+));
+
         }
         // 检查JmResp的data字段
         let data = jm_resp
