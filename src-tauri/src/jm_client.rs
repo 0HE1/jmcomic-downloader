@@ -1,10 +1,10 @@
 use std::sync::Arc;
-use std::time: :{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aes:: cipher:: generic_array::GenericArray;
-use aes::cipher: :{BlockDecrypt, KeyInit};
+use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::Aes256;
-use anyhow: :{anyhow, Context};
+use anyhow::{anyhow, Context};
 use base64::engine::general_purpose;
 use base64::Engine;
 use bytes::Bytes;
@@ -14,12 +14,12 @@ use reqwest:: cookie:: Jar;
 use reqwest::StatusCode;
 use reqwest_middleware::ClientWithMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
-use reqwest_retry: :{Jitter, RetryTransientMiddleware};
+use reqwest_retry::{Jitter, RetryTransientMiddleware};
 use serde_json::json;
 use tauri::AppHandle;
 
 use crate::download_manager::IMAGE_DOMAIN;
-use crate::extensions: :{AnyhowErrorToStringChain, AppHandleExt};
+use crate::extensions::{AnyhowErrorToStringChain, AppHandleExt};
 use crate::responses::{
     GetChapterRespData, GetComicRespData, GetFavoriteRespData, GetUserProfileRespData,
     GetWeeklyInfoRespData, GetWeeklyRespData, JmResp, RedirectRespData, SearchResp, SearchRespData,
