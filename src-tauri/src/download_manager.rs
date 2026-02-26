@@ -25,7 +25,7 @@ use crate::extensions::{AnyhowErrorToStringChain, AppHandleExt};
 use crate::types::{ChapterInfo, Comic, DownloadFormat};
 use crate::utils::filename_filter;
 use crate::{utils, DownloadSpeedEvent};
-
+use chrono::prelude::*;   // ← 加在文件顶部所有 use 的最下面
 pub const IMAGE_DOMAIN: &str = "cdn-msp2.jmapiproxy2.cc";
 
 /// 用于管理下载任务
@@ -121,6 +121,42 @@ impl DownloadManager {
         Ok(())
     }
 
+// ==================== 【你的日期文件夹功能】 ====================
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct DirFmtParams {
+    pub year: u32,
+    pub month: u32,
+    pub day: u32,
+    pub date: String,   // "2026/02/26" 格式
+}
+
+impl DirFmtParams {
+    /// 获取今天的日期参数
+    pub fn today() -> Self {
+        let now = Local::now();
+        let year = now.year() as u32;
+        let month = now.month();
+        let day = now.day();
+        Self {
+            year,
+            month,
+            day,
+            date: format!("{:04}/{:02}/{:02}", year, month, day),
+        }
+    }
+
+    /// 返回子文件夹路径（用于 join）
+    pub fn get_date_sub_dir(&self) -> String {
+        format!("{:04}/{:02}/{:02}", self.year, self.month, self.day)
+    }
+}
+
+// 可选：给 DownloadManager 加一个便捷方法
+impl DownloadManager {
+    pub fn get_today_date_folder(&self) -> String {
+        DirFmtParams::today().get_date_sub_dir()
+    }
+}
     #[allow(clippy::cast_precision_loss)]
     async fn emit_download_speed_loop(self) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
