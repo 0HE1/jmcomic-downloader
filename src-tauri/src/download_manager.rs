@@ -121,17 +121,17 @@ impl DownloadManager {
         Ok(())
     }
 
-// ==================== 【你的日期文件夹功能】 ====================
+// ==================== 【你的日期文件夹功能】年/月/日自动建文件夹 ====================
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
-pub struct DirFmtParams {
+pub struct DateParams {
     pub year: u32,
     pub month: u32,
     pub day: u32,
-    pub date: String,   // "2026/02/26" 格式
+    pub date: String, // "2026/02/26" 格式
 }
 
-impl DirFmtParams {
-    /// 获取今天的日期参数
+impl DateParams {
+    /// 获取今天的日期参数（使用本地时区，香港时间也没问题）
     pub fn today() -> Self {
         let now = Local::now();
         let year = now.year() as u32;
@@ -151,24 +151,10 @@ impl DirFmtParams {
     }
 }
 
-// 可选：给 DownloadManager 加一个便捷方法
+// 可选：给 DownloadManager 加便捷方法（前端如果想显示“今天日期文件夹”可以调用）
 impl DownloadManager {
     pub fn get_today_date_folder(&self) -> String {
-        DirFmtParams::today().get_date_sub_dir()
-    }
-}
-    #[allow(clippy::cast_precision_loss)]
-    async fn emit_download_speed_loop(self) {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-
-        loop {
-            interval.tick().await;
-            let byte_per_sec = self.byte_per_sec.swap(0, Ordering::Relaxed);
-            let mega_byte_per_sec = byte_per_sec as f64 / 1024.0 / 1024.0;
-            let speed = format!("{mega_byte_per_sec:.2}MB/s");
-            // 发送总进度条下载速度事件
-            let _ = DownloadSpeedEvent { speed }.emit(&self.app);
-        }
+        DateParams::today().get_date_sub_dir()
     }
 }
 
@@ -1027,12 +1013,9 @@ impl ChapterInfo {
         fmt_params: &DirFmtParams,
     ) -> anyhow::Result<PathBuf> {
         use strfmt::strfmt;
-
         let json_value =
             serde_json::to_value(fmt_params).context("将DirFmtParams转为serde_json::Value失败")?;
-
         let json_map = json_value.as_object().context("DirFmtParams不是JSON对象")?;
-
         let vars: HashMap<String, String> = json_map
             .into_iter()
             .map(|(k, v)| {
@@ -1044,15 +1027,20 @@ impl ChapterInfo {
                 (key, value)
             })
             .collect();
-
         let (download_dir, dir_fmt) = {
             let config = app.get_config();
             let config = config.read();
             (config.download_dir.clone(), config.dir_fmt.clone())
         };
 
-        let dir_fmt_parts: Vec<&str> = dir_fmt.split('/').collect();
+        // ==================== 【关键修改】自动插入当天日期文件夹 ====================
+        // 效果：下载目录/2026/02/26/漫画标题/章节标题/...
+        // 当天所有漫画共用同一个日期文件夹，已存在时不会重复创建
+        let date_sub_dir = DateParams::today().get_date_sub_dir();
+        let mut chapter_download_dir = download_dir.join(date_sub_dir);
+        // ==================== 修改结束 ====================
 
+        let dir_fmt_parts: Vec<&str> = dir_fmt.split('/').collect();
         let mut dir_names = Vec::new();
         for fmt in dir_fmt_parts {
             let dir_name = strfmt(fmt, &vars).context("格式化目录名失败")?;
@@ -1061,18 +1049,15 @@ impl ChapterInfo {
                 dir_names.push(dir_name);
             }
         }
-
         if dir_names.len() < 2 {
             let err_msg =
                 "配置中的下载目录格式至少要有两个层级，例如：{comic_title}/{chapter_title}";
             return Err(anyhow!(err_msg));
         }
         // 将格式化后的目录名拼接成完整的目录路径
-        let mut chapter_download_dir = download_dir;
         for dir_name in dir_names {
             chapter_download_dir = chapter_download_dir.join(dir_name);
         }
-
         Ok(chapter_download_dir)
     }
 
