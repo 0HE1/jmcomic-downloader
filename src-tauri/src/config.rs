@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::{AppHandle, Manager};
 
+use chrono::Local;  // 新增：用于日期格式化
+
 const API_DOMAIN_1: &str = "www.cdnzack.cc";
 const API_DOMAIN_2: &str = "www.cdnhth.cc";
 const API_DOMAIN_3: &str = "www.cdnhth.net";
