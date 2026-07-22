@@ -344,6 +344,16 @@ impl DownloadTask {
             tracing::error!(err_title, message = string_chain);
         }
 
+        // ===== 下载完成后，将整本漫画移到当天日期文件夹下 =====
+        // 这样多次下载的漫画最终都会归集到最新日期，无需翻多个文件夹
+        if let Err(err) = self.move_comic_to_today_folder() {
+            let err_title = format!("`{comic_title}`移动到当天日期文件夹失败");
+            let string_chain = err.to_string_chain();
+            tracing::error!(err_title, message = string_chain);
+            // 移动失败不中断流程，漫画仍然保留在旧目录
+        }
+        // ===== 结束 =====
+
         self.sleep_between_chapter().await;
         tracing::info!(comic_title, chapter_title, "章节下载成功");
 
@@ -661,6 +671,55 @@ impl DownloadTask {
             total_img_count: self.total_img_count.load(Ordering::Relaxed),
         }
         .emit(&self.app);
+    }
+
+    /// 将整个漫画目录从旧日期文件夹移动到当天日期文件夹
+    /// 使得同一漫画的所有章节最终都集中在最新下载日期下
+    fn move_comic_to_today_folder(&self) -> anyhow::Result<()> {
+        let comic_download_dir = self
+            .comic
+            .comic_download_dir
+            .as_ref()
+            .context("comic_download_dir 为 None")?;
+
+        let download_dir = self.app.get_config().read().download_dir.clone();
+        let today_sub_dir = DateParams::today().get_date_sub_dir();
+        let today_comic_dir = download_dir.join(&today_sub_dir).join(
+            comic_download_dir
+                .file_name()
+                .context("无法获取漫画目录名")?,
+        );
+
+        // 已经在当天文件夹中，无需移动
+        if *comic_download_dir == today_comic_dir {
+            return Ok(());
+        }
+
+        // 目标路径已存在（已被其他章节下载任务移动过），无需重复移动
+        if today_comic_dir.exists() {
+            return Ok(());
+        }
+
+        // 创建当天日期文件夹
+        let today_dir = download_dir.join(&today_sub_dir);
+        std::fs::create_dir_all(&today_dir)
+            .context(format!("创建文件夹`{}`失败", today_dir.display()))?;
+
+        // 使用 std::fs::rename 移动整个漫画目录（同一驱动器下是原子操作）
+        std::fs::rename(comic_download_dir, &today_comic_dir).context(format!(
+            "移动`{}`到`{}`失败",
+            comic_download_dir.display(),
+            today_comic_dir.display()
+        ))?;
+
+        tracing::info!(
+            "已将漫画`{}`从`{}`移动到`{}`",
+            self.comic.name,
+            comic_download_dir.display(),
+            today_comic_dir.display()
+        );
+
+        Ok(())
     }
 }
 
@@ -1032,6 +1091,40 @@ pub struct DirFmtParams {
     pub order: i64,
 }
 
+/// 在下载目录下查找漫画是否已存在于某个日期文件夹中
+/// 找到则返回该日期子文件夹名，否则返回 None
+fn find_existing_comic_date_dir(
+    download_dir: &Path,
+    dir_fmt: &str,
+    vars: &HashMap<String, String>,
+) -> Option<String> {
+    use strfmt::strfmt;
+
+    // 获取 dir_fmt 的第一个分段（即漫画文件夹名的格式），例如 "{comic_title}"
+    let first_fmt = dir_fmt.split('/').next()?;
+    let comic_dir_name = strfmt(first_fmt, vars).ok()?;
+    let comic_dir_name = filename_filter(&comic_dir_name);
+    if comic_dir_name.is_empty() {
+        return None;
+    }
+
+    // 遍历下载目录下的直接子文件夹（即日期文件夹，如 "2026年7月22日"）
+    let entries = std::fs::read_dir(download_dir).ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
+        if !entry.file_type().ok()?.is_dir() {
+            continue;
+        }
+        let date_dir_name = entry.file_name().to_string_lossy().to_string();
+        // 检查该日期文件夹下是否有对应漫画的目录
+        let comic_dir = download_dir.join(&date_dir_name).join(&comic_dir_name);
+        if comic_dir.is_dir() {
+            return Some(date_dir_name);
+        }
+    }
+    None
+}
+
 impl ChapterInfo {
     fn get_chapter_download_dir_by_fmt(
         app: &AppHandle,
@@ -1058,11 +1151,13 @@ impl ChapterInfo {
             (config.download_dir.clone(), config.dir_fmt.clone())
         };
 
-        // ==================== 【关键修改】自动插入当天日期文件夹 ====================
-        // 效果：下载目录/2026/02/26/漫画标题/章节标题/...
-        // 当天所有漫画共用同一个日期文件夹，已存在时不会重复创建
-        let date_sub_dir = DateParams::today().get_date_sub_dir();
-        let mut chapter_download_dir = download_dir.join(date_sub_dir);
+        // ==================== 【关键修改】智能选择日期文件夹 ====================
+        // 1. 先检查漫画是否已存在于某个旧的日期文件夹中（例如之前下载过章节）
+        // 2. 如果存在，复用该文件夹，使同一漫画的所有章节都在同一日期文件夹下
+        // 3. 如果是首次下载该漫画，则使用当天日期创建新文件夹
+        let date_sub_dir = find_existing_comic_date_dir(&download_dir, &dir_fmt, &vars)
+            .unwrap_or_else(|| DateParams::today().get_date_sub_dir());
+        let mut chapter_download_dir = download_dir.join(&date_sub_dir);
         // ==================== 修改结束 ====================
 
         let dir_fmt_parts: Vec<&str> = dir_fmt.split('/').collect();
