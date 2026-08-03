@@ -1,6 +1,10 @@
 # Logs
 logs
 *.log
+tauri-dev-log.txt
+
+# Personal notes
+github.md
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

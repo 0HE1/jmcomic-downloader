@@ -191,6 +191,48 @@ impl DownloadManager {
     }
 }
 
+/// 计算当天日期文件夹下漫画目录的目标路径（纯函数，便于测试）
+/// 即 `{download_dir}/{today_sub_dir}/{漫画目录名}`
+fn compute_today_comic_dir(
+    download_dir: &Path,
+    today_sub_dir: &str,
+    comic_download_dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    let comic_dir_name = comic_download_dir
+        .file_name()
+        .context("无法获取漫画目录名")?;
+    Ok(download_dir.join(today_sub_dir).join(comic_dir_name))
+}
+
+/// 将整本漫画目录从旧日期文件夹移动到当天日期文件夹（纯函数，便于测试）
+/// 已在当天文件夹中则不做任何操作，返回移动后的目标路径
+fn move_comic_dir_to_today(
+    comic_download_dir: &Path,
+    download_dir: &Path,
+    today_sub_dir: &str,
+) -> anyhow::Result<PathBuf> {
+    let today_comic_dir = compute_today_comic_dir(download_dir, today_sub_dir, comic_download_dir)?;
+
+    // 已经在当天文件夹中，无需移动
+    if comic_download_dir == today_comic_dir {
+        return Ok(today_comic_dir);
+    }
+
+    // 创建当天日期文件夹
+    let today_dir = download_dir.join(today_sub_dir);
+    std::fs::create_dir_all(&today_dir)
+        .context(format!("创建文件夹`{}`失败", today_dir.display()))?;
+
+    // 尝试移动整个漫画目录（同一驱动器下是原子操作）
+    std::fs::rename(comic_download_dir, &today_comic_dir).context(format!(
+        "将 `{}` 移动到 `{}` 失败",
+        comic_download_dir.display(),
+        today_comic_dir.display()
+    ))?;
+
+    Ok(today_comic_dir)
+}
+
 #[derive(Clone)]
 struct DownloadTask {
     app: AppHandle,
@@ -684,41 +726,59 @@ impl DownloadTask {
 
         let download_dir = self.app.get_config().read().download_dir.clone();
         let today_sub_dir = DateParams::today().get_date_sub_dir();
-        let today_comic_dir = download_dir.join(&today_sub_dir).join(
-            comic_download_dir
-                .file_name()
-                .context("无法获取漫画目录名")?,
-        );
 
-        // 已经在当天文件夹中，无需移动
-        if *comic_download_dir == today_comic_dir {
+        match move_comic_dir_to_today(comic_download_dir, &download_dir, &today_sub_dir) {
+            Ok(today_comic_dir) => {
+                tracing::info!(
+                    "已将漫画`{}`从`{}`移动到`{}`",
+                    self.comic.name,
+                    comic_download_dir.display(),
+                    today_comic_dir.display()
+                );
+                Ok(())
+            }
+            Err(err) => {
+                // 移动失败：可能已被其他章节的下载任务抢先移动了整本漫画
+                // （批量下载同一漫画时并发触发），此时只把当前章节目录移过去
+                tracing::debug!(
+                    err = %err,
+                    "移动整本漫画失败（可能已被其他任务移动），尝试仅移动当前章节"
+                );
+                let today_comic_dir =
+                    compute_today_comic_dir(&download_dir, &today_sub_dir, comic_download_dir)?;
+                self.move_current_chapter_dir_to(&today_comic_dir)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// 将当前章节的目录移动到目标漫画目录下
+    /// 用于整本漫画已被其他章节任务移动、仅需迁移本章节的情况
+    fn move_current_chapter_dir_to(&self, target_comic_dir: &Path) -> anyhow::Result<()> {
+        let Some(chapter_download_dir) = &self.chapter_info.chapter_download_dir else {
+            return Ok(());
+        };
+        // 若当前章节目录不存在，说明整本漫画已随其他任务移动，无需处理
+        if !chapter_download_dir.exists() {
             return Ok(());
         }
-
-        // 目标路径已存在（已被其他章节下载任务移动过），无需重复移动
-        if today_comic_dir.exists() {
+        let chapter_name = chapter_download_dir
+            .file_name()
+            .context("无法获取章节目录名")?;
+        let target = target_comic_dir.join(chapter_name);
+        if target.exists() {
             return Ok(());
         }
-
-        // 创建当天日期文件夹
-        let today_dir = download_dir.join(&today_sub_dir);
-        std::fs::create_dir_all(&today_dir)
-            .context(format!("创建文件夹`{}`失败", today_dir.display()))?;
-
-        // 使用 std::fs::rename 移动整个漫画目录（同一驱动器下是原子操作）
-        std::fs::rename(comic_download_dir, &today_comic_dir).context(format!(
-            "移动`{}`到`{}`失败",
-            comic_download_dir.display(),
-            today_comic_dir.display()
+        std::fs::rename(chapter_download_dir, &target).context(format!(
+            "移动章节`{}`到`{}`失败",
+            chapter_download_dir.display(),
+            target.display()
         ))?;
-
         tracing::info!(
-            "已将漫画`{}`从`{}`移动到`{}`",
-            self.comic.name,
-            comic_download_dir.display(),
-            today_comic_dir.display()
+            "已将章节`{}`移动到`{}`",
+            chapter_download_dir.display(),
+            target.display()
         );
-
         Ok(())
     }
 }
@@ -1041,6 +1101,9 @@ impl Comic {
 
         let mut first_chapter_download_dir = None;
 
+        // 如果漫画已有已知的下载目录（之前下载过，前端传入），将其作为日期文件夹选择的优先依据
+        let known_comic_download_dir = self.comic_download_dir.clone();
+
         for chapter_info in &mut self.chapter_infos {
             let chapter_title = &chapter_info.chapter_title;
 
@@ -1053,9 +1116,12 @@ impl Comic {
                 order: chapter_info.order,
             };
 
-            let chapter_download_dir =
-                ChapterInfo::get_chapter_download_dir_by_fmt(app, &dir_fmt_params)
-                    .context(format!("章节`{chapter_title}`根据fmt获取章节下载目录失败"))?;
+            let chapter_download_dir = ChapterInfo::get_chapter_download_dir_by_fmt(
+                app,
+                &dir_fmt_params,
+                known_comic_download_dir.as_deref(),
+            )
+            .context(format!("章节`{chapter_title}`根据fmt获取章节下载目录失败"))?;
 
             if first_chapter_download_dir.is_none() {
                 first_chapter_download_dir = Some(chapter_download_dir.clone());
@@ -1091,24 +1157,65 @@ pub struct DirFmtParams {
     pub order: i64,
 }
 
-/// 在下载目录下查找漫画是否已存在于某个日期文件夹中
-/// 找到则返回该日期子文件夹名，否则返回 None
-fn find_existing_comic_date_dir(
+/// 在下载目录下查找已存在的漫画目录的实际路径
+/// 找到则返回该漫画目录的完整路径（如 `{download_dir}/2026年3月2日/[作者]漫画A(111)`），否则返回 None
+///
+/// 匹配优先级（保证复用已存在目录的实际路径，无论标题如何变化）：
+/// 1. 已知的漫画下载目录（已下载过的漫画，前端传入），校验结构合法且真实存在后直接复用其实际路径
+/// 2. 按漫画目录名（dir_fmt 第一个分段格式化结果）在已有日期文件夹中查找
+/// 3. 按漫画ID在`元数据.json`中查找（漫画标题变化后仍能匹配）
+fn find_existing_comic_dir(
     download_dir: &Path,
     dir_fmt: &str,
     vars: &HashMap<String, String>,
-) -> Option<String> {
+    comic_id: i64,
+    known_comic_download_dir: Option<&Path>,
+) -> Option<PathBuf> {
     use strfmt::strfmt;
 
-    // 获取 dir_fmt 的第一个分段（即漫画文件夹名的格式），例如 "{comic_title}"
-    let first_fmt = dir_fmt.split('/').next()?;
-    let comic_dir_name = strfmt(first_fmt, vars).ok()?;
-    let comic_dir_name = filename_filter(&comic_dir_name);
-    if comic_dir_name.is_empty() {
-        return None;
+    // 1. 已知的漫画下载目录：结构形如 `{download_dir}/{日期}/{漫画目录}` 且真实存在，直接复用其实际路径
+    if let Some(known_dir) = known_comic_download_dir {
+        let date_dir = known_dir.parent()?;
+        // 日期文件夹必须是 download_dir 的直接子目录且漫画目录真实存在于磁盘
+        if date_dir.parent() == Some(download_dir) && known_dir.is_dir() {
+            let name = date_dir.file_name()?.to_string_lossy().to_string();
+            // 名称符合 "X年X月X日" 格式才视为日期文件夹
+            if name.contains('年') && name.contains('月') && name.contains('日') {
+                tracing::debug!(name, "复用已知漫画下载目录的实际路径");
+                return Some(known_dir.to_path_buf());
+            }
+        }
     }
 
-    // 遍历下载目录下的直接子文件夹（即日期文件夹，如 "2026年7月22日"）
+    // 2. 按漫画目录名查找：获取 dir_fmt 的第一个分段（即漫画文件夹名的格式），例如 "{comic_title}"
+    // 注意：格式化失败时仅跳过名称匹配，不影响后续的ID匹配
+    let comic_dir_name = dir_fmt
+        .split('/')
+        .next()
+        .and_then(|fmt| strfmt(fmt, vars).ok())
+        .map(|name| filename_filter(&name))
+        .unwrap_or_default();
+    if !comic_dir_name.is_empty() {
+        tracing::debug!(comic_dir_name, "按漫画目录名在已有日期文件夹中查找");
+        // 遍历下载目录下的直接子文件夹（即日期文件夹，如 "2026年7月22日"）
+        let entries = std::fs::read_dir(download_dir).ok()?;
+        for entry in entries {
+            let entry = entry.ok()?;
+            if !entry.file_type().ok()?.is_dir() {
+                continue;
+            }
+            let date_dir_name = entry.file_name().to_string_lossy().to_string();
+            // 检查该日期文件夹下是否有对应漫画的目录
+            let comic_dir = download_dir.join(&date_dir_name).join(&comic_dir_name);
+            if comic_dir.is_dir() {
+                tracing::debug!(date_dir_name, "在已有日期文件夹中找到漫画目录");
+                return Some(comic_dir);
+            }
+        }
+    }
+
+    // 3. 按漫画ID在元数据中查找（比名称匹配更可靠：即使漫画标题发生变化，也能找到其原有的目录）
+    tracing::debug!(comic_id, "按漫画ID在元数据中查找已有漫画目录");
     let entries = std::fs::read_dir(download_dir).ok()?;
     for entry in entries {
         let entry = entry.ok()?;
@@ -1116,21 +1223,110 @@ fn find_existing_comic_date_dir(
             continue;
         }
         let date_dir_name = entry.file_name().to_string_lossy().to_string();
-        // 检查该日期文件夹下是否有对应漫画的目录
-        let comic_dir = download_dir.join(&date_dir_name).join(&comic_dir_name);
-        if comic_dir.is_dir() {
-            return Some(date_dir_name);
+        let date_dir = download_dir.join(&date_dir_name);
+
+        // 该日期文件夹下的每个子目录都可能是漫画目录
+        for comic_entry in std::fs::read_dir(&date_dir).ok()? {
+            let comic_entry = comic_entry.ok()?;
+            if !comic_entry.file_type().ok()?.is_dir() {
+                continue;
+            }
+            let metadata_path = comic_entry.path().join("元数据.json");
+            if !metadata_path.is_file() {
+                continue;
+            }
+            let Ok(metadata_str) = std::fs::read_to_string(&metadata_path) else {
+                continue;
+            };
+            let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&metadata_str) else {
+                continue;
+            };
+            if json_value.get("id").and_then(serde_json::Value::as_i64) == Some(comic_id) {
+                tracing::debug!(date_dir_name, comic_id, "按漫画ID找到已有漫画目录");
+                return Some(comic_entry.path());
+            }
         }
     }
     None
+}
+
+/// 根据下载目录、目录格式、变量和已知漫画目录计算章节下载目录（纯函数，便于测试）
+///
+/// 行为（与需求一致）：
+/// - 已下载过的漫画（无论标题如何变化）：直接复用其目录在磁盘上的实际路径，只追加章节目录名；
+/// - 全新漫画：在当天日期文件夹下按 dir_fmt 创建目录。
+///
+/// 查找优先级：
+/// 1. 已知的漫画下载目录（已下载过的漫画，前端传入）
+/// 2. 按漫画目录名在已有日期文件夹中查找（下载时复用旧文件夹）
+/// 3. 按漫画ID在元数据.json中查找（漫画标题变化后仍能匹配）
+fn compute_chapter_download_dir(
+    download_dir: &Path,
+    dir_fmt: &str,
+    vars: &HashMap<String, String>,
+    comic_id: i64,
+    known_comic_download_dir: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    use strfmt::strfmt;
+
+    let existing_comic_dir = find_existing_comic_dir(
+        download_dir,
+        dir_fmt,
+        vars,
+        comic_id,
+        known_comic_download_dir,
+    );
+
+    let dir_fmt_parts: Vec<&str> = dir_fmt.split('/').collect();
+    let mut dir_names = Vec::new();
+    for fmt in dir_fmt_parts {
+        let dir_name = strfmt(fmt, vars).context("格式化目录名失败")?;
+        let dir_name = filename_filter(&dir_name);
+        if !dir_name.is_empty() {
+            dir_names.push(dir_name);
+        }
+    }
+    if dir_names.len() < 2 {
+        let err_msg = "配置中的下载目录格式至少要有两个层级，例如：{comic_title}/{chapter_title}";
+        return Err(anyhow!(err_msg));
+    }
+
+    let chapter_download_dir = if let Some(existing_comic_dir) = existing_comic_dir {
+        // 复用已存在漫画目录的实际路径，只追加章节目录名（dir_fmt 第一个分段之后的部分）
+        tracing::debug!(
+            comic_id,
+            existing_dir = %existing_comic_dir.display(),
+            "复用已存在漫画目录的实际路径，仅追加章节目录名"
+        );
+        let mut dir = existing_comic_dir;
+        for dir_name in dir_names.iter().skip(1) {
+            dir = dir.join(dir_name);
+        }
+        dir
+    } else {
+        // 未找到已存在的漫画目录，使用当天日期创建新目录
+        let today_sub_dir = DateParams::today().get_date_sub_dir();
+        tracing::debug!(
+            comic_id,
+            today_sub_dir,
+            "未找到已存在的漫画目录，使用当天日期创建新目录"
+        );
+        let mut dir = download_dir.join(&today_sub_dir);
+        for dir_name in &dir_names {
+            dir = dir.join(dir_name);
+        }
+        dir
+    };
+
+    Ok(chapter_download_dir)
 }
 
 impl ChapterInfo {
     fn get_chapter_download_dir_by_fmt(
         app: &AppHandle,
         fmt_params: &DirFmtParams,
+        known_comic_download_dir: Option<&Path>,
     ) -> anyhow::Result<PathBuf> {
-        use strfmt::strfmt;
         let json_value =
             serde_json::to_value(fmt_params).context("将DirFmtParams转为serde_json::Value失败")?;
         let json_map = json_value.as_object().context("DirFmtParams不是JSON对象")?;
@@ -1151,34 +1347,13 @@ impl ChapterInfo {
             (config.download_dir.clone(), config.dir_fmt.clone())
         };
 
-        // ==================== 【关键修改】智能选择日期文件夹 ====================
-        // 1. 先检查漫画是否已存在于某个旧的日期文件夹中（例如之前下载过章节）
-        // 2. 如果存在，复用该文件夹，使同一漫画的所有章节都在同一日期文件夹下
-        // 3. 如果是首次下载该漫画，则使用当天日期创建新文件夹
-        let date_sub_dir = find_existing_comic_date_dir(&download_dir, &dir_fmt, &vars)
-            .unwrap_or_else(|| DateParams::today().get_date_sub_dir());
-        let mut chapter_download_dir = download_dir.join(&date_sub_dir);
-        // ==================== 修改结束 ====================
-
-        let dir_fmt_parts: Vec<&str> = dir_fmt.split('/').collect();
-        let mut dir_names = Vec::new();
-        for fmt in dir_fmt_parts {
-            let dir_name = strfmt(fmt, &vars).context("格式化目录名失败")?;
-            let dir_name = filename_filter(&dir_name);
-            if !dir_name.is_empty() {
-                dir_names.push(dir_name);
-            }
-        }
-        if dir_names.len() < 2 {
-            let err_msg =
-                "配置中的下载目录格式至少要有两个层级，例如：{comic_title}/{chapter_title}";
-            return Err(anyhow!(err_msg));
-        }
-        // 将格式化后的目录名拼接成完整的目录路径
-        for dir_name in dir_names {
-            chapter_download_dir = chapter_download_dir.join(dir_name);
-        }
-        Ok(chapter_download_dir)
+        compute_chapter_download_dir(
+            &download_dir,
+            &dir_fmt,
+            &vars,
+            fmt_params.comic_id,
+            known_comic_download_dir,
+        )
     }
 
     fn get_temp_download_dir(&self) -> anyhow::Result<PathBuf> {
@@ -1198,5 +1373,369 @@ impl ChapterInfo {
 
         let temp_download_dir = parent.join(format!(".下载中-{chapter_download_dir_name}"));
         Ok(temp_download_dir)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    /// 创建临时测试目录结构：
+    /// {temp}/download_dir/2026年3月2日/[作者]漫画A(111)/元数据.json + 章节目录
+    /// {temp}/download_dir/2026年3月2日/[作者]漫画A(111)/第1话
+    /// {temp}/download_dir/2026年7月1日/[作者]漫画B(222)/元数据.json
+    fn setup_test_dir() -> (tempfile::TempDir, PathBuf) {
+        let temp_dir = tempfile::tempdir().expect("创建临时目录失败");
+        let download_dir = temp_dir.path().join("download_dir");
+
+        // 漫画A在2026年3月2日下载过
+        let comic_a_old = download_dir
+            .join("2026年3月2日")
+            .join("[作者]漫画A(111)");
+        fs::create_dir_all(comic_a_old.join("第1话")).expect("创建漫画A目录失败");
+        fs::write(
+            comic_a_old.join("元数据.json"),
+            r#"{"id":111,"name":"漫画A"}"#,
+        )
+        .expect("写入漫画A元数据失败");
+
+        // 漫画B在2026年7月1日下载过
+        let comic_b = download_dir.join("2026年7月1日").join("[作者]漫画B(222)");
+        fs::create_dir_all(&comic_b).expect("创建漫画B目录失败");
+        fs::write(
+            comic_b.join("元数据.json"),
+            r#"{"id":222,"name":"漫画B"}"#,
+        )
+        .expect("写入漫画B元数据失败");
+
+        (temp_dir, download_dir)
+    }
+
+    #[test]
+    fn test_find_existing_comic_dir_by_known_dir() {
+        let (_temp, download_dir) = setup_test_dir();
+
+        // 已知目录是 download_dir/日期/漫画目录 结构，应直接复用其实际路径
+        let known_dir = download_dir.join("2026年3月2日").join("[作者]漫画A(111)");
+        let found = find_existing_comic_dir(
+            &download_dir,
+            "{comic_title}/{chapter_title}",
+            &HashMap::new(),
+            111,
+            Some(&known_dir),
+        );
+        assert_eq!(found, Some(known_dir.clone()));
+
+        // 不存在的目录（如漫画已被删除）应回退到其他匹配方式
+        let missing_dir = download_dir.join("2026年5月1日").join("不存在的漫画");
+        let mut vars = HashMap::new();
+        vars.insert("comic_title".to_string(), "[作者]漫画A(111)".to_string());
+        let found = find_existing_comic_dir(
+            &download_dir,
+            "{comic_title}/{chapter_title}",
+            &vars,
+            111,
+            Some(&missing_dir),
+        );
+        assert_eq!(found, Some(known_dir.clone()));
+
+        // 目录不是 download_dir 的直接子目录时（旧版本无日期文件夹结构）应回退
+        let legacy_dir = download_dir.join("[作者]漫画A(111)");
+        let found = find_existing_comic_dir(
+            &download_dir,
+            "{comic_title}/{chapter_title}",
+            &vars,
+            111,
+            Some(&legacy_dir),
+        );
+        assert_eq!(found, Some(known_dir.clone()));
+
+        // 传入 None 时按其他方式匹配
+        let found = find_existing_comic_dir(
+            &download_dir,
+            "{comic_title}/{chapter_title}",
+            &vars,
+            111,
+            None,
+        );
+        assert_eq!(found, Some(known_dir));
+    }
+
+    #[test]
+    fn test_find_existing_comic_dir_by_name() {
+        let (_temp, download_dir) = setup_test_dir();
+
+        let mut vars = HashMap::new();
+        vars.insert("comic_title".to_string(), "[作者]漫画A(111)".to_string());
+
+        // 漫画A在2026年3月2日，名称匹配应返回该目录实际路径
+        let found = find_existing_comic_dir(
+            &download_dir,
+            "{comic_title}/{chapter_title}",
+            &vars,
+            111,
+            None,
+        );
+        assert_eq!(
+            found,
+            Some(download_dir.join("2026年3月2日").join("[作者]漫画A(111)"))
+        );
+
+        // 未下载过的漫画应返回 None
+        let mut vars_new = HashMap::new();
+        vars_new.insert("comic_title".to_string(), "未下载的漫画".to_string());
+        let found = find_existing_comic_dir(
+            &download_dir,
+            "{comic_title}/{chapter_title}",
+            &vars_new,
+            999,
+            None,
+        );
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_find_existing_comic_dir_by_id() {
+        let (_temp, download_dir) = setup_test_dir();
+
+        // 标题已变化的场景：名称匹配不到，但按ID仍应找到旧目录的实际路径
+        let mut vars_changed = HashMap::new();
+        vars_changed.insert("comic_title".to_string(), "[新标题]漫画A(111)".to_string());
+
+        // 漫画A的ID是111，应在2026年3月2日找到
+        let found = find_existing_comic_dir(
+            &download_dir,
+            "{comic_title}/{chapter_title}",
+            &vars_changed,
+            111,
+            None,
+        );
+        assert_eq!(
+            found,
+            Some(download_dir.join("2026年3月2日").join("[作者]漫画A(111)"))
+        );
+
+        // 漫画B的ID是222，应在2026年7月1日找到
+        let found = find_existing_comic_dir(
+            &download_dir,
+            "{comic_title}/{chapter_title}",
+            &vars_changed,
+            222,
+            None,
+        );
+        assert_eq!(
+            found,
+            Some(download_dir.join("2026年7月1日").join("[作者]漫画B(222)"))
+        );
+
+        // 不存在的漫画ID应返回 None
+        let found = find_existing_comic_dir(
+            &download_dir,
+            "{comic_title}/{chapter_title}",
+            &vars_changed,
+            999,
+            None,
+        );
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_find_existing_comic_dir_priority() {
+        let (_temp, download_dir) = setup_test_dir();
+
+        // 场景1：已知目录优先于名称匹配
+        let known_dir = download_dir.join("2026年3月2日").join("[作者]漫画A(111)");
+        let mut vars = HashMap::new();
+        vars.insert("comic_title".to_string(), "[作者]漫画A(111)".to_string());
+        let found = find_existing_comic_dir(
+            &download_dir,
+            "{comic_title}/{chapter_title}",
+            &vars,
+            111,
+            Some(&known_dir),
+        );
+        assert_eq!(found, Some(known_dir.clone()));
+
+        // 场景2：已知目录不存在时，回退到ID匹配（漫画标题已变化的场景）
+        let stale_known_dir = download_dir.join("2026年5月1日").join("[作者]漫画A(111)");
+        let mut vars_changed = HashMap::new();
+        vars_changed.insert("comic_title".to_string(), "[新标题]漫画A(111)".to_string());
+        let found = find_existing_comic_dir(
+            &download_dir,
+            "{comic_title}/{chapter_title}",
+            &vars_changed,
+            111,
+            Some(&stale_known_dir),
+        );
+        assert_eq!(
+            found,
+            Some(download_dir.join("2026年3月2日").join("[作者]漫画A(111)"))
+        );
+    }
+
+    /// 构造漫画A的 vars（标题不变场景）
+    fn comic_a_vars(chapter_title: &str) -> HashMap<String, String> {
+        let mut vars = HashMap::new();
+        vars.insert("comic_title".to_string(), "[作者]漫画A(111)".to_string());
+        vars.insert("chapter_title".to_string(), chapter_title.to_string());
+        vars.insert("comic_id".to_string(), "111".to_string());
+        vars.insert("chapter_id".to_string(), "900".to_string());
+        vars.insert("author".to_string(), "作者".to_string());
+        vars.insert("order".to_string(), "9".to_string());
+        vars
+    }
+
+    /// 行为验证（标题不变）：漫画A旧目录 2026年3月2日/[作者]漫画A(111)
+    /// 下载新章节 → 章节写入 2026年3月2日/[作者]漫画A(111)/第X话（复用旧路径，只追加章节目录名）
+    #[test]
+    fn test_compute_chapter_download_dir_reuse_old_dir_title_unchanged() {
+        let (_temp, download_dir) = setup_test_dir();
+
+        let vars = comic_a_vars("第X话");
+        let known_dir = download_dir.join("2026年3月2日").join("[作者]漫画A(111)");
+
+        // 已知目录（前端传入）优先：直接复用其实际路径，只追加章节目录名
+        let chapter_dir = compute_chapter_download_dir(
+            &download_dir,
+            "{comic_title}/{chapter_title}",
+            &vars,
+            111,
+            Some(&known_dir),
+        )
+        .unwrap();
+        assert_eq!(chapter_dir, known_dir.join("第X话"));
+
+        // 未传已知目录时，按名称匹配也能复用旧目录实际路径
+        let chapter_dir = compute_chapter_download_dir(
+            &download_dir,
+            "{comic_title}/{chapter_title}",
+            &vars,
+            111,
+            None,
+        )
+        .unwrap();
+        assert_eq!(chapter_dir, known_dir.join("第X话"));
+    }
+
+    /// 行为验证（标题变化）：标题变化后名称匹配不到，但按ID仍复用旧目录实际路径
+    #[test]
+    fn test_compute_chapter_download_dir_reuse_old_dir_title_changed() {
+        let (_temp, download_dir) = setup_test_dir();
+
+        let mut vars = comic_a_vars("第X话");
+        vars.insert("comic_title".to_string(), "[新标题]漫画A(111)".to_string());
+
+        let chapter_dir = compute_chapter_download_dir(
+            &download_dir,
+            "{comic_title}/{chapter_title}",
+            &vars,
+            111,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            chapter_dir,
+            download_dir
+                .join("2026年3月2日")
+                .join("[作者]漫画A(111)")
+                .join("第X话")
+        );
+    }
+
+    /// 行为验证：全新漫画（磁盘上不存在）时，在当天日期文件夹下按 dir_fmt 创建
+    #[test]
+    fn test_compute_chapter_download_dir_new_comic_uses_today() {
+        let (_temp, download_dir) = setup_test_dir();
+
+        let mut vars = HashMap::new();
+        vars.insert("comic_title".to_string(), "全新漫画".to_string());
+        vars.insert("chapter_title".to_string(), "第1话".to_string());
+        vars.insert("comic_id".to_string(), "999".to_string());
+        vars.insert("chapter_id".to_string(), "1".to_string());
+        vars.insert("author".to_string(), "作者".to_string());
+        vars.insert("order".to_string(), "1".to_string());
+
+        let chapter_dir = compute_chapter_download_dir(
+            &download_dir,
+            "{comic_title}/{chapter_title}",
+            &vars,
+            999,
+            None,
+        )
+        .unwrap();
+        let today_sub_dir = DateParams::today().get_date_sub_dir();
+        assert_eq!(chapter_dir, download_dir.join(&today_sub_dir).join("全新漫画").join("第1话"));
+    }
+
+    /// 行为验证：下载完成后将整本漫画移动到当天日期文件夹
+    /// 旧目录 2026年3月2日/[作者]漫画A(111) → 今天/[作者]漫画A(111)
+    #[test]
+    fn test_move_comic_dir_to_today() {
+        let (_temp, download_dir) = setup_test_dir();
+
+        let old_comic_dir = download_dir.join("2026年3月2日").join("[作者]漫画A(111)");
+        let today_sub_dir = "2026年8月3日";
+
+        // 移动前旧目录存在
+        assert!(old_comic_dir.is_dir());
+
+        let target = move_comic_dir_to_today(&old_comic_dir, &download_dir, today_sub_dir).unwrap();
+        assert_eq!(
+            target,
+            download_dir.join(today_sub_dir).join("[作者]漫画A(111)")
+        );
+
+        // 旧目录已不存在，新目录存在且保留了章节目录
+        assert!(!old_comic_dir.exists());
+        assert!(target.is_dir());
+        assert!(target.join("第1话").is_dir());
+        assert!(target.join("元数据.json").is_file());
+
+        // 已在当天文件夹中时，再次移动应无副作用
+        let again = move_comic_dir_to_today(&target, &download_dir, today_sub_dir).unwrap();
+        assert_eq!(again, target);
+        assert!(target.is_dir());
+    }
+
+    /// 端到端行为验证（标题不变）：
+    /// 漫画A旧目录 2026年3月2日/[作者]漫画A(111)，下载新章节第X话
+    /// → 章节写入 2026年3月2日/[作者]漫画A(111)/第X话（复用旧路径）
+    /// → 完成后整本移动到 当天日期/[作者]漫画A(111)/
+    #[test]
+    fn test_end_to_end_append_chapter_then_move_to_today() {
+        let (_temp, download_dir) = setup_test_dir();
+
+        let old_comic_dir = download_dir.join("2026年3月2日").join("[作者]漫画A(111)");
+        let today_sub_dir = "2026年8月3日";
+
+        // 1. 计算新章节下载目录：复用旧目录实际路径，只追加章节目录名
+        let vars = comic_a_vars("第X话");
+        let chapter_dir = compute_chapter_download_dir(
+            &download_dir,
+            "{comic_title}/{chapter_title}",
+            &vars,
+            111,
+            Some(&old_comic_dir),
+        )
+        .unwrap();
+        assert_eq!(chapter_dir, old_comic_dir.join("第X话"));
+
+        // 2. 模拟章节下载完成：创建章节目录
+        std::fs::create_dir_all(&chapter_dir).expect("创建章节目录失败");
+
+        // 3. 下载完成后整本移动到当天日期文件夹
+        let target = move_comic_dir_to_today(&old_comic_dir, &download_dir, today_sub_dir).unwrap();
+        assert_eq!(
+            target,
+            download_dir.join(today_sub_dir).join("[作者]漫画A(111)")
+        );
+
+        // 旧目录已不存在，新目录包含新章节与旧章节
+        assert!(!old_comic_dir.exists());
+        assert!(target.join("第X话").is_dir());
+        assert!(target.join("第1话").is_dir());
+        assert!(target.join("元数据.json").is_file());
     }
 }
