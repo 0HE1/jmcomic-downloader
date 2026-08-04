@@ -11,7 +11,7 @@ use bytes::Bytes;
 use image::codecs::png;
 use image::codecs::png::PngEncoder;
 use image::{ImageFormat, RgbImage};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::AppHandle;
@@ -43,6 +43,9 @@ pub struct DownloadManager {
     img_sem: Arc<Semaphore>,
     byte_per_sec: Arc<AtomicU64>,
     download_tasks: Arc<RwLock<HashMap<i64, DownloadTask>>>,
+    /// 串行化同一漫画目录上的文件系统操作（重命名临时目录、移动整本漫画等），
+    /// 避免批量下载同一漫画的多个章节时并发移动同一目录产生竞态（os error 3）
+    dir_move_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -69,6 +72,7 @@ impl DownloadManager {
             img_sem: Arc::new(Semaphore::new(img_concurrency)),
             byte_per_sec: Arc::new(AtomicU64::new(0)),
             download_tasks: Arc::new(RwLock::new(HashMap::new())),
+            dir_move_lock: Arc::new(Mutex::new(())),
         };
 
         tauri::async_runtime::spawn(manager.clone().emit_download_speed_loop());
@@ -369,6 +373,12 @@ impl DownloadTask {
             return;
         }
         // 至此，章节的图片全部下载成功
+        // 下面的“重命名临时目录 + 保存元数据 + 移动整本漫画”都涉及对同一漫画目录的文件系统操作。
+        // 批量下载同一本漫画的多个章节时这些任务并发执行，会互相竞争移动同一个目录，
+        // 导致“整本漫画已被其他任务移动，本章节却仍按旧路径处理”的竞态（os error 3），
+        // 因此用同一把互斥锁串行化这段目录操作。
+        let _dir_move_guard = self.download_manager.dir_move_lock.lock();
+
         if let Err(err) = self.rename_temp_download_dir(&temp_download_dir) {
             let err_title = format!("`{comic_title} - {chapter_title}`重命名临时下载目录失败");
             let string_chain = err.to_string_chain();
@@ -769,11 +779,26 @@ impl DownloadTask {
         if target.exists() {
             return Ok(());
         }
-        std::fs::rename(chapter_download_dir, &target).context(format!(
-            "移动章节`{}`到`{}`失败",
-            chapter_download_dir.display(),
-            target.display()
-        ))?;
+        // 目标漫画目录可能尚未创建（例如整本移动因其他原因失败），先创建父目录，
+        // 否则 `rename` 会因目标父目录不存在而报 os error 3
+        std::fs::create_dir_all(target_comic_dir)
+            .context(format!("创建目标漫画目录`{}`失败", target_comic_dir.display()))?;
+        if let Err(err) = std::fs::rename(chapter_download_dir, &target) {
+            // 竞态兜底：`rename` 失败且源目录已不存在，说明整本漫画已被其他章节任务移动，
+            // 本章节已随整本目录一起移动，视为成功，不再报错
+            if !chapter_download_dir.exists() {
+                tracing::info!(
+                    "本章节`{}`已随整本漫画移动，跳过单独移动",
+                    chapter_download_dir.display()
+                );
+                return Ok(());
+            }
+            return Err(err).context(format!(
+                "移动章节`{}`到`{}`失败",
+                chapter_download_dir.display(),
+                target.display()
+            ));
+        }
         tracing::info!(
             "已将章节`{}`移动到`{}`",
             chapter_download_dir.display(),
