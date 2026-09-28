@@ -10,7 +10,7 @@ pub struct RedirectRespData {
     pub search_query: String,
     pub total: i64,
     #[serde(rename = "redirect_aid")]
-    pub redirect_aid: String,
+    pub redirect_aid: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]

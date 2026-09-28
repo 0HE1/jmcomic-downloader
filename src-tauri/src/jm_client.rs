@@ -692,7 +692,7 @@ impl JmClient {
         // 尝试将解密后的数据解析为 RedirectRespData
         if let Ok(redirect_resp_data) = serde_json::from_str::<RedirectRespData>(&data) {
             let comic_resp_data = self
-                .get_comic(redirect_resp_data.redirect_aid. parse()?)
+                .get_comic(redirect_resp_data.redirect_aid)
                 .await?;
             return Ok(SearchResp:: ComicRespData(Box::new(comic_resp_data)));
         }
